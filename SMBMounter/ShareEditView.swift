@@ -163,7 +163,7 @@ struct ShareEditView: View {
                                 .foregroundColor(.red)
                                 .fixedSize(horizontal: false, vertical: true)
                         } else if isDuplicate {
-                            Text("A share with this server, share name, and mount point already exists. Change at least one field.")
+                            Text("Another share is already using this mount point. Choose a different location.")
                                 .font(.caption)
                                 .foregroundColor(.red)
                                 .fixedSize(horizontal: false, vertical: true)
