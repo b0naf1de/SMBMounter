@@ -21,7 +21,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Connect all Auto-Shares")
-                
+
                 Button {
                     showAddSheet = true
                 } label: {

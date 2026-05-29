@@ -151,6 +151,9 @@ class ShareManager: ObservableObject {
     // MARK: - Monitoring
 
     func startMonitoring() {
+        // Startup permission check: disable shares whose mount point the user can't use.
+        applyPermissionStatuses()
+
         let uptime = ProcessInfo.processInfo.systemUptime
         let remainingBootDelay = max(0, postBootAutoConnectDelay - uptime)
         let startupDelay = max(normalLaunchAutoConnectDelay, remainingBootDelay)
@@ -271,11 +274,17 @@ class ShareManager: ObservableObject {
     func mountAllAutoShares() {
         guard isNetworkAvailable else { return }
 
-        let needsReconnect = shares.contains {
-            $0.autoMount && !isManuallyDisconnected($0.id) && !isMounted($0) && !isPendingMount($0.id)
+        // Shares whose mount point the user cannot prepare are skipped entirely so the
+        // app never tries (and never needs admin) — they stay visibly disabled.
+        func isBlocked(_ share: SMBShare) -> Bool {
+            Self.runtimeBlockReason(mountPoint: share.resolvedMountPoint, shareName: share.shareName) != nil
         }
 
-        for share in shares where share.autoMount && !isManuallyDisconnected(share.id) {
+        let needsReconnect = shares.contains {
+            $0.autoMount && !isManuallyDisconnected($0.id) && !isMounted($0) && !isPendingMount($0.id) && !isBlocked($0)
+        }
+
+        for share in shares where share.autoMount && !isManuallyDisconnected(share.id) && !isBlocked(share) {
             if !isMounted(share) {
                 mount(share)
             }
@@ -559,7 +568,198 @@ class ShareManager: ObservableObject {
                 }
             }
         }
+
+        if mountMethod(for: share) == .smbfs {
+            let targetPath = (share.resolvedMountPoint as NSString).expandingTildeInPath
+            return vols.contains { vol in
+                let vp = vol.path
+                return vp == targetPath
+                    || vp == targetPath + "/"
+                    || (vp.hasSuffix("/") && String(vp.dropLast()) == targetPath)
+            }
+        }
         return false
+    }
+
+    /// Returns the filesystem paths where this share is currently mounted, regardless
+    /// of which method mounted it. The Finder method mounts at /Volumes/<shareName>
+    /// (ignoring the configured mount point), while mount_smbfs mounts at the configured
+    /// path — so the real location must be discovered, not assumed from resolvedMountPoint.
+    func mountedPaths(for share: SMBShare) -> [String] {
+        let baseHost: String
+        if share.host.hasSuffix(".local") && !share.host.contains("._smb._tcp") {
+            baseHost = String(share.host.dropLast(6)).lowercased()
+        } else if share.host.contains("._smb._tcp") {
+            baseHost = (share.host.components(separatedBy: "._smb._tcp").first ?? share.host).lowercased()
+        } else {
+            baseHost = share.host.lowercased()
+        }
+        let shareName = share.shareName.lowercased()
+        let targetPath = (share.resolvedMountPoint as NSString).expandingTildeInPath
+
+        let vols = FileManager.default.mountedVolumeURLs(
+            includingResourceValuesForKeys: [.volumeURLForRemountingKey],
+            options: []
+        ) ?? []
+
+        var paths: [String] = []
+        for vol in vols {
+            var matched = false
+            if let r = try? vol.resourceValues(forKeys: [.volumeURLForRemountingKey]).volumeURLForRemounting {
+                let s = r.absoluteString.lowercased()
+                if s.contains("smb") && s.contains(baseHost) && s.contains(shareName) {
+                    matched = true
+                }
+            }
+            if !matched {
+                let vp = vol.path
+                if vp == targetPath || vp == targetPath + "/"
+                    || (vp.hasSuffix("/") && String(vp.dropLast()) == targetPath) {
+                    matched = true
+                }
+            }
+            if matched { paths.append(vol.path) }
+        }
+        return paths
+    }
+
+    // MARK: - Mount Method Determination (dynamic, never stored)
+
+    /// Chooses the mount method. The single no-preparation case is /Volumes/<shareName>,
+    /// which uses Finder (macOS creates that directory itself, no admin prompt). Every
+    /// other location — including other paths under /Volumes — uses mount_smbfs, which
+    /// mounts at the exact path provided. Such paths must exist and be user-owned before
+    /// the mount; `prepareMountPoint(_:)` creates them (with consent) when needed.
+    static func autoMountMethod(forMountPoint rawPath: String, shareName: String) -> MountMethod {
+        let path = (rawPath as NSString).expandingTildeInPath
+        return path == "/Volumes/\(shareName)" ? .finder : .smbfs
+    }
+
+    func mountMethod(for share: SMBShare) -> MountMethod {
+        Self.autoMountMethod(forMountPoint: share.resolvedMountPoint, shareName: share.shareName)
+    }
+
+    /// Describes what (if anything) must happen before a mount point can be used.
+    enum MountPointPreparation: Equatable {
+        case finderManaged                       // /Volumes/<shareName> — macOS handles it
+        case ready                               // exists and is user-writable
+        case needsCreation(requiresAuth: Bool)   // missing; will be created (+chowned)
+        case needsPermissionFix                  // exists but not writable; chown required (admin)
+        case unusable(String)                    // exists but isn't a usable directory
+    }
+
+    /// Inspects the mount point and returns what preparation it needs. `requiresAuth`
+    /// is true when creation must write into a directory the user can't (e.g. the
+    /// root-owned /Volumes), which means administrator authorization.
+    static func mountPointPreparation(mountPoint rawPath: String, shareName: String) -> MountPointPreparation {
+        let path = (rawPath as NSString).expandingTildeInPath
+        if path == "/Volumes/\(shareName)" { return .finderManaged }
+
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: path, isDirectory: &isDir) {
+            if !isDir.boolValue { return .unusable("\(path) exists but is not a folder.") }
+            return fm.isWritableFile(atPath: path) ? .ready : .needsPermissionFix
+        }
+
+        // Missing — find the deepest existing ancestor to decide if creation needs admin.
+        var dir = (path as NSString).deletingLastPathComponent
+        while !dir.isEmpty && dir != "/" {
+            if fm.fileExists(atPath: dir, isDirectory: &isDir) {
+                if !isDir.boolValue { return .unusable("\(dir) is not a folder.") }
+                return .needsCreation(requiresAuth: !fm.isWritableFile(atPath: dir))
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return .needsCreation(requiresAuth: !fm.isWritableFile(atPath: "/"))
+    }
+
+    /// The reason a share cannot be auto-mounted right now, or nil if it can. A mount
+    /// point that only needs a non-privileged folder creation is *not* blocked — the
+    /// mount path creates it silently. Anything that would need admin (which we never
+    /// prompt for unattended) or is structurally unusable is blocked.
+    static func runtimeBlockReason(mountPoint rawPath: String, shareName: String) -> String? {
+        let path = (rawPath as NSString).expandingTildeInPath
+        switch mountPointPreparation(mountPoint: path, shareName: shareName) {
+        case .finderManaged, .ready:
+            return nil
+        case .needsCreation(let requiresAuth):
+            return requiresAuth
+                ? "Mount point \(path) doesn't exist and needs administrator authorization to create. Edit the share to create it."
+                : nil
+        case .needsPermissionFix:
+            return "You don't have permission to use \(path). Edit the share to set it up."
+        case .unusable(let reason):
+            return reason
+        }
+    }
+
+    /// Creates the mount-point hierarchy if missing and makes it owned by the current
+    /// user, so a later user-level mount_smbfs can mount onto it. Uses administrator
+    /// authorization (a system prompt) only when the location isn't user-writable.
+    /// Returns nil on success or an error string. Call only after the user has agreed.
+    static func prepareMountPoint(_ rawPath: String) -> String? {
+        let path = (rawPath as NSString).expandingTildeInPath
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+
+        if fm.fileExists(atPath: path, isDirectory: &isDir) {
+            if !isDir.boolValue { return "\(path) exists but is not a folder." }
+            if fm.isWritableFile(atPath: path) { return nil }   // already usable
+            // exists but not writable -> fall through to privileged chown
+        } else {
+            // Try a non-privileged create when the parent is user-writable.
+            var dir = (path as NSString).deletingLastPathComponent
+            var ancestor = "/"
+            while !dir.isEmpty && dir != "/" {
+                if fm.fileExists(atPath: dir) { ancestor = dir; break }
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+            if fm.isWritableFile(atPath: ancestor) {
+                do {
+                    try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+                    return nil
+                } catch {
+                    return "Failed to create \(path): \(error.localizedDescription)"
+                }
+            }
+        }
+
+        // Privileged path: create (if needed) and hand ownership to the user.
+        let user = NSUserName()
+        let script = "do shell script \"mkdir -p '\(path)' && chown '\(user)' '\(path)'\" with administrator privileges"
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = ["-e", script]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+        do {
+            try task.run()
+        } catch {
+            return "Failed to create \(path): \(error.localizedDescription)"
+        }
+        task.waitUntilExit()
+        if task.terminationStatus != 0 {
+            return "Could not create \(path) — administrator authorization was cancelled or failed."
+        }
+        return nil
+    }
+
+    /// Applies the startup check: any share that can't be auto-mounted (unusable path,
+    /// or one needing admin-level creation/permission changes we won't prompt for
+    /// unattended) is marked with an error so it is visibly disabled and skipped.
+    func applyPermissionStatuses() {
+        DispatchQueue.main.async {
+            for i in self.shares.indices {
+                let s = self.shares[i]
+                if let reason = Self.runtimeBlockReason(mountPoint: s.resolvedMountPoint, shareName: s.shareName),
+                   !self.isMounted(s) {
+                    self.shares[i].status = .error
+                    self.shares[i].lastError = reason
+                }
+            }
+            self.updateAppIcon()
+        }
     }
 
     func updateMountStatuses() {
@@ -586,6 +786,100 @@ class ShareManager: ObservableObject {
                 delegate.updateStatusIcon(hasError: hasError)
             }
         }
+    }
+
+    // MARK: - SMBFS Mount
+
+    private func splitDomainUser(_ username: String) -> (domain: String?, user: String) {
+        if let backslash = username.firstIndex(of: "\\") {
+            let domain = String(username[username.startIndex..<backslash])
+            let user = String(username[username.index(after: backslash)...])
+            return (domain.isEmpty ? nil : domain, user)
+        }
+        return (nil, username)
+    }
+
+    private func ensureMountPointExists(_ path: String) -> String? {
+        let fm = FileManager.default
+
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: path, isDirectory: &isDir) {
+            return isDir.boolValue ? nil : "Mount point \(path) exists but is not a directory"
+        }
+
+        // smbfs is only ever used for user-writable, non-/Volumes paths (the method
+        // is auto-selected from the location), so a plain mkdir always suffices — no
+        // administrator authorization is needed or requested.
+        do {
+            try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+            return nil
+        } catch {
+            return "Failed to create mount point: \(error.localizedDescription)"
+        }
+    }
+
+    private func runSmbfsMount(share: SMBShare, host: String) -> String? {
+        let expandedPath = (share.resolvedMountPoint as NSString).expandingTildeInPath
+
+        if let err = ensureMountPointExists(expandedPath) {
+            return err
+        }
+
+        let password = KeychainHelper.shared.getPassword(for: share.id) ?? ""
+        let (domain, user) = splitDomainUser(share.username)
+
+        var smbfsUserAllowed = CharacterSet.urlUserAllowed
+        smbfsUserAllowed.remove(charactersIn: ";")
+        var smbfsPassAllowed = CharacterSet.urlPasswordAllowed
+        smbfsPassAllowed.remove(charactersIn: ":")
+
+        let urlString: String
+        if !user.isEmpty && !password.isEmpty {
+            let encodedUser = user.addingPercentEncoding(withAllowedCharacters: smbfsUserAllowed) ?? user
+            let encodedPass = password.addingPercentEncoding(withAllowedCharacters: smbfsPassAllowed) ?? password
+            if let domain = domain {
+                let encodedDomain = domain.addingPercentEncoding(withAllowedCharacters: smbfsUserAllowed) ?? domain
+                urlString = "//\(encodedDomain);\(encodedUser):\(encodedPass)@\(host)/\(share.shareName)"
+            } else {
+                urlString = "//\(encodedUser):\(encodedPass)@\(host)/\(share.shareName)"
+            }
+        } else if !user.isEmpty {
+            let encodedUser = user.addingPercentEncoding(withAllowedCharacters: smbfsUserAllowed) ?? user
+            urlString = "//\(encodedUser)@\(host)/\(share.shareName)"
+        } else {
+            urlString = "//\(host)/\(share.shareName)"
+        }
+
+        let task = Process()
+        task.launchPath = "/sbin/mount_smbfs"
+        task.arguments = [urlString, expandedPath]
+        let errPipe = Pipe()
+        task.standardError = errPipe
+        task.standardOutput = Pipe()
+
+        do {
+            try task.run()
+        } catch {
+            return "Failed to launch mount_smbfs: \(error.localizedDescription)"
+        }
+
+        let deadline = Date().addingTimeInterval(15)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if task.isRunning {
+            task.terminate()
+            return "mount_smbfs timed out"
+        }
+        task.waitUntilExit()
+
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrMsg = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if task.terminationStatus != 0 {
+            return stderrMsg.isEmpty ? "mount_smbfs failed (exit \(task.terminationStatus))" : stderrMsg
+        }
+        return nil
     }
 
     // MARK: - Finder Mount
@@ -644,6 +938,17 @@ class ShareManager: ObservableObject {
 
         guard let idx = shares.firstIndex(where: { $0.id == share.id }) else { return }
         guard shares[idx].status != .mounted else { return }
+
+        // Refuse to mount shares whose mount point isn't ready. This keeps the app from
+        // ever needing administrator authorization at mount time (preparation happens
+        // in the editor, with consent) or mounting somewhere other than specified.
+        if let reason = Self.runtimeBlockReason(mountPoint: shares[idx].resolvedMountPoint, shareName: shares[idx].shareName) {
+            shares[idx].status = .error
+            shares[idx].lastError = reason
+            updateAppIcon()
+            return
+        }
+
         guard beginPendingMount(share.id) else { return }
 
         shares[idx].status = .connecting
@@ -678,21 +983,39 @@ class ShareManager: ObservableObject {
             return
         }
 
-        let password = KeychainHelper.shared.getPassword(for: shareID) ?? ""
-        let urlString: String
-        if !share.username.isEmpty && !password.isEmpty {
-            let encodedPass = password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? password
-            let encodedUser = share.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? share.username
-            urlString = "smb://\(encodedUser):\(encodedPass)@\(host)/\(share.shareName)"
-        } else if !share.username.isEmpty {
-            let encodedUser = share.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? share.username
-            urlString = "smb://\(encodedUser)@\(host)/\(share.shareName)"
-        } else {
-            urlString = "smb://\(host)/\(share.shareName)"
-        }
-
         guard shouldKeepRetrying(share) else { return }
-        runFinderMount(urlString: urlString)
+
+        switch mountMethod(for: share) {
+        case .finder:
+            // The credentialed smb:// URL is only needed by the Finder method. Build
+            // it (and read the keychain) here so an smbfs mount doesn't read the
+            // password twice — runSmbfsMount fetches its own and builds its own URL.
+            let password = KeychainHelper.shared.getPassword(for: shareID) ?? ""
+            let urlString: String
+            if !share.username.isEmpty && !password.isEmpty {
+                let encodedPass = password.addingPercentEncoding(withAllowedCharacters: .urlPasswordAllowed) ?? password
+                let encodedUser = share.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? share.username
+                urlString = "smb://\(encodedUser):\(encodedPass)@\(host)/\(share.shareName)"
+            } else if !share.username.isEmpty {
+                let encodedUser = share.username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? share.username
+                urlString = "smb://\(encodedUser)@\(host)/\(share.shareName)"
+            } else {
+                urlString = "smb://\(host)/\(share.shareName)"
+            }
+            runFinderMount(urlString: urlString)
+        case .smbfs:
+            if let errorMsg = runSmbfsMount(share: share, host: host) {
+                DispatchQueue.main.async {
+                    guard let idx = self.shares.firstIndex(where: { $0.id == shareID }) else { return }
+                    self.failCount[shareID, default: 0] += 1
+                    self.shares[idx].status = .disconnected
+                    self.shares[idx].lastError = errorMsg
+                    self.scheduleOneExtraRetryIfNeeded(for: shareID)
+                    self.updateAppIcon()
+                }
+                return
+            }
+        }
 
         let mounted = waitUntilMounted(share, timeout: postMountVerifyTimeout)
 
@@ -732,22 +1055,33 @@ class ShareManager: ObservableObject {
         failCount[share.id] = nil
 
         unmountQueue.async {
-            for _ in 0..<6 {
-                if !self.isMounted(share) {
+            for attempt in 0..<6 {
+                let paths = self.mountedPaths(for: share)
+                if paths.isEmpty {
                     break
                 }
-                let task = Process()
-                task.launchPath = "/sbin/umount"
-                task.arguments = [share.resolvedMountPoint]
-                try? task.run()
-                task.waitUntilExit()
+                for path in paths {
+                    let task = Process()
+                    task.launchPath = "/sbin/umount"
+                    // First attempt is graceful; escalate to a forced unmount on retries
+                    // (network volumes with open handles often need -f).
+                    task.arguments = attempt == 0 ? [path] : ["-f", path]
+                    try? task.run()
+                    task.waitUntilExit()
+                }
                 Thread.sleep(forTimeInterval: 0.3)
             }
 
             DispatchQueue.main.async {
                 guard let idx = self.shares.firstIndex(where: { $0.id == share.id }) else { return }
-                self.shares[idx].status = .disconnected
-                self.shares[idx].lastError = nil
+                if self.isMounted(share) {
+                    // Reflect reality instead of falsely showing "disconnected".
+                    self.shares[idx].status = .error
+                    self.shares[idx].lastError = "Unmount failed — volume is still mounted."
+                } else {
+                    self.shares[idx].status = .disconnected
+                    self.shares[idx].lastError = nil
+                }
                 self.updateAppIcon()
             }
         }
@@ -758,12 +1092,16 @@ class ShareManager: ObservableObject {
     func addShare(_ share: SMBShare, password: String) {
         var s = share
         s.status = .disconnected
+        if let reason = Self.runtimeBlockReason(mountPoint: s.resolvedMountPoint, shareName: s.shareName) {
+            s.status = .error
+            s.lastError = reason
+        }
         shares.append(s)
         if !password.isEmpty {
             KeychainHelper.shared.savePassword(password, for: s.id)
         }
         saveShares()
-        if s.autoMount {
+        if s.autoMount && s.status != .error {
             mount(s)
         }
     }
@@ -779,13 +1117,23 @@ class ShareManager: ObservableObject {
 
         shares[idx] = share
 
+        // Reflect the (re-evaluated) state immediately so editing a share to a valid
+        // path clears a prior error, and vice versa.
+        if let reason = Self.runtimeBlockReason(mountPoint: shares[idx].resolvedMountPoint, shareName: shares[idx].shareName) {
+            shares[idx].status = .error
+            shares[idx].lastError = reason
+        } else {
+            shares[idx].status = .disconnected
+            shares[idx].lastError = nil
+        }
+
         if let pwd = password, !pwd.isEmpty {
             KeychainHelper.shared.savePassword(pwd, for: share.id)
         }
 
         saveShares()
 
-        if share.autoMount || (wasAutoMount && wasMounted) {
+        if (share.autoMount || (wasAutoMount && wasMounted)) && shares[idx].status != .error {
             mount(share)
         }
     }
