@@ -3,28 +3,20 @@ import SwiftUI
 struct ShareRowView: View {
     @Binding var share: SMBShare
     @EnvironmentObject var manager: ShareManager
-    
+
     var body: some View {
         HStack(spacing: 12) {
             statusIcon
                 .frame(width: 24)
-            
+
             VStack(alignment: .leading, spacing: 2) {
-                HStack {
-                    Text(share.name)
-                        .font(.headline)
-                    if share.autoMount {
-                        Image(systemName: "bolt.fill")
-                            .font(.caption2)
-                            .foregroundColor(.accentColor)
-                            .help("Auto-Mount active")
-                    }
-                }
-                
+                Text(share.name)
+                    .font(.headline)
+
                 Text(share.smbURL)
                     .font(.caption)
                     .foregroundColor(.secondary)
-                
+
                 if let error = share.lastError, share.status == .error {
                     Text(error)
                         .font(.caption2)
@@ -36,16 +28,16 @@ struct ShareRowView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            
+
             Spacer()
-            
+
             Text(share.status.rawValue)
                 .font(.caption)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 .background(statusBackground)
                 .cornerRadius(10)
-            
+
             Button {
                 if manager.isMounted(share) {
                     manager.unmount(share)
@@ -64,9 +56,19 @@ struct ShareRowView: View {
         .padding(.vertical, 6)
         .padding(.horizontal, 4)
     }
-    
+
     @ViewBuilder
     var statusIcon: some View {
+        if share.autoMount {
+            autoMountStatusIcon
+        } else {
+            baseStatusIcon
+        }
+    }
+
+    /// Standard icon for shares not configured for auto-mount.
+    @ViewBuilder
+    var baseStatusIcon: some View {
         switch share.status {
         case .mounted:
             Image(systemName: "externaldrive.fill.badge.checkmark")
@@ -82,7 +84,40 @@ struct ShareRowView: View {
                 .foregroundColor(.red)
         }
     }
-    
+
+    /// Same icon set but with a circular-arrow overlay to indicate the share is
+    /// configured for auto-mount (recurring/repeat behaviour).
+    @ViewBuilder
+    var autoMountStatusIcon: some View {
+        switch share.status {
+        case .mounted:
+            autoMountIcon("externaldrive.fill.badge.checkmark", color: .green)
+        case .disconnected:
+            autoMountIcon("externaldrive.badge.minus", color: .secondary)
+        case .connecting:
+            ZStack {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 18))
+                    .foregroundColor(.accentColor.opacity(0.4))
+                ProgressView()
+                    .scaleEffect(0.5)
+            }
+        case .error:
+            autoMountIcon("externaldrive.badge.exclamationmark", color: .red)
+        }
+    }
+
+    private func autoMountIcon(_ name: String, color: Color) -> some View {
+        ZStack {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 18))
+                .foregroundColor(color.opacity(0.4))
+            Image(systemName: name)
+                .font(.system(size: 10))
+                .foregroundColor(color)
+        }
+    }
+
     var statusBackground: Color {
         switch share.status {
         case .mounted: return Color.green.opacity(0.15)

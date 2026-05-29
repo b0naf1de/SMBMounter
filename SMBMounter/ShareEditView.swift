@@ -3,6 +3,7 @@ import SwiftUI
 enum EditMode {
     case add
     case edit(SMBShare)
+    case clone(SMBShare)
 }
 
 struct ShareEditView: View {
@@ -10,6 +11,7 @@ struct ShareEditView: View {
     let onSave: (SMBShare, String) -> Void
     
     @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var manager: ShareManager
 
     @State private var name: String = ""
     @State private var host: String = ""
@@ -30,8 +32,9 @@ struct ShareEditView: View {
 
     var title: String {
         switch mode {
-        case .add: return "Add Share"
-        case .edit: return "Edit Share"
+        case .add:   return "Add Share"
+        case .edit:  return "Edit Share"
+        case .clone: return "Clone Share"
         }
     }
     
@@ -79,10 +82,27 @@ struct ShareEditView: View {
         }
     }
 
+    /// True when the current field values exactly match an existing share (same host,
+    /// shareName, and resolved mount point). Editing a share excludes itself.
+    var isDuplicate: Bool {
+        let candidate = SMBShare(
+            name: name,
+            host: host.trimmingCharacters(in: .whitespaces),
+            shareName: shareName.trimmingCharacters(in: .whitespaces),
+            username: username,
+            mountPoint: mountPointText
+        )
+        // When editing, inject the original id so the check skips this share itself.
+        var probe = candidate
+        if case .edit(let original) = mode { probe.id = original.id }
+        return manager.isDuplicate(probe)
+    }
+
     var saveEnabled: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty &&
         !shareName.trimmingCharacters(in: .whitespaces).isEmpty &&
         mountPointError == nil &&
+        !isDuplicate &&
         !isPreparing
     }
     
@@ -139,6 +159,11 @@ struct ShareEditView: View {
                             .frame(width: 100)
                         if let error = mountPointError {
                             Text(error + " Choose a different mount point.")
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if isDuplicate {
+                            Text("A share with this server, share name, and mount point already exists. Change at least one field.")
                                 .font(.caption)
                                 .foregroundColor(.red)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -306,6 +331,22 @@ struct ShareEditView: View {
                 mountPointCustomized = true
             }
         }
+
+        if case .clone(let share) = mode {
+            // Name intentionally left blank — the user must choose a distinct name.
+            host = share.host
+            shareName = share.shareName
+            username = share.username
+            autoMount = share.autoMount
+            password = KeychainHelper.shared.getPassword(for: share.id) ?? ""
+            if share.mountPoint.isEmpty {
+                mountPointText = "/Volumes/\(share.shareName)"
+                mountPointCustomized = false
+            } else {
+                mountPointText = share.mountPoint
+                mountPointCustomized = true
+            }
+        }
     }
     
     func save() {
@@ -330,6 +371,18 @@ struct ShareEditView: View {
             share.username = username
             share.mountPoint = mountPointText
             share.autoMount = autoMount
+            onSave(share, password)
+
+        case .clone:
+            // Clone always creates a new share with a fresh UUID (via the default initializer).
+            let share = SMBShare(
+                name: displayName,
+                host: host,
+                shareName: shareName,
+                username: username,
+                mountPoint: mountPointText,
+                autoMount: autoMount
+            )
             onSave(share, password)
         }
     }

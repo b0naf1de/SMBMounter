@@ -1089,6 +1089,17 @@ class ShareManager: ObservableObject {
 
     // MARK: - CRUD
 
+    /// Returns true if an existing share already targets the same server path and
+    /// mount point as `share`. Used to prevent fully duplicate entries.
+    func isDuplicate(_ share: SMBShare) -> Bool {
+        shares.contains {
+            $0.id != share.id &&
+            $0.host.lowercased() == share.host.lowercased() &&
+            $0.shareName.lowercased() == share.shareName.lowercased() &&
+            $0.resolvedMountPoint == share.resolvedMountPoint
+        }
+    }
+
     func addShare(_ share: SMBShare, password: String) {
         var s = share
         s.status = .disconnected
