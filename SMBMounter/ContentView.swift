@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject var manager: ShareManager
     @State private var showAddSheet = false
     @State private var editingShare: SMBShare? = nil
+    @State private var cloningShare: SMBShare? = nil
     
     var body: some View {
         VStack(spacing: 0) {
@@ -61,6 +62,7 @@ struct ContentView: View {
                         ShareRowView(share: $share)
                             .contextMenu {
                                 Button("Edit") { editingShare = share }
+                                Button("Clone") { cloningShare = share }
                                 Divider()
                                 Button("Connect now") { manager.mount(share) }
                                 Button("Disconnect") { manager.unmount(share) }
@@ -102,11 +104,19 @@ struct ContentView: View {
             ShareEditView(mode: .add) { share, password in
                 manager.addShare(share, password: password)
             }
+            .environmentObject(manager)
         }
         .sheet(item: $editingShare) { share in
             ShareEditView(mode: .edit(share)) { updatedShare, password in
                 manager.updateShare(updatedShare, password: password)
             }
+            .environmentObject(manager)
+        }
+        .sheet(item: $cloningShare) { share in
+            ShareEditView(mode: .clone(share)) { newShare, password in
+                manager.addShare(newShare, password: password)
+            }
+            .environmentObject(manager)
         }
         .onAppear {
             manager.requestNotificationPermission()

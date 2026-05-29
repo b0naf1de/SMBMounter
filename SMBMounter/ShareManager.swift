@@ -755,6 +755,15 @@ class ShareManager: ObservableObject {
 
     // MARK: - CRUD
 
+    /// Returns true if an existing share already uses the same mount point.
+    /// Two shares cannot mount to the same location.
+    func isDuplicate(_ share: SMBShare) -> Bool {
+        shares.contains {
+            $0.id != share.id &&
+            $0.resolvedMountPoint == share.resolvedMountPoint
+        }
+    }
+
     func addShare(_ share: SMBShare, password: String) {
         var s = share
         s.status = .disconnected
