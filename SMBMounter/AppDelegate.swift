@@ -18,7 +18,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
+        // Give the status item a stable identity so macOS persists its position
+        // and third-party menu-bar managers (Bartender, Ice, etc.) can reliably
+        // track it across launches. Without an autosaveName, the system assigns a
+        // non-deterministic identity that is never persisted, so menu-bar managers
+        // treat the item as brand-new on every launch and may hide it by default.
+        statusItem?.autosaveName = "com.smbmounter.statusitem"
+        statusItem?.isVisible = true
+
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "externaldrive.fill.badge.wifi", accessibilityDescription: "SMBMounter")
             button.action = #selector(togglePopover)
